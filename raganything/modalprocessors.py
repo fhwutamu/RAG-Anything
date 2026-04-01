@@ -24,7 +24,11 @@ from lightrag.utils import (
 from lightrag.lightrag import LightRAG
 from dataclasses import asdict
 from lightrag.kg.shared_storage import get_namespace_data, get_pipeline_status_lock
-from lightrag.operate import extract_entities, merge_nodes_and_edges
+from lightrag.operate import (
+    extract_entities,
+    extract_multimodal_entities,
+    merge_nodes_and_edges,
+)
 
 # Import prompt templates
 from raganything.prompt import PROMPTS
@@ -386,6 +390,9 @@ class BaseModalProcessor:
         # Use LightRAG's configuration and functions
         self.embedding_func = lightrag.embedding_func
         self.llm_model_func = lightrag.llm_model_func
+        self.multimodal_entity_extract_func = getattr(
+            lightrag, "multimodal_entity_extract_func", None
+        )
         self.global_config = asdict(lightrag)
         self.hashing_kv = lightrag.llm_response_cache
         self.tokenizer = lightrag.tokenizer
@@ -402,6 +409,131 @@ class BaseModalProcessor:
         # Content source for context extraction
         self.content_source = None
         self.content_format = "auto"
+
+    def _normalize_modal_content(
+        self, modal_content: Any, fallback_key: str = "content"
+    ) -> Dict[str, Any]:
+        if isinstance(modal_content, str):
+            try:
+                parsed = json.loads(modal_content)
+            except json.JSONDecodeError:
+                parsed = {fallback_key: modal_content}
+        elif isinstance(modal_content, dict):
+            parsed = dict(modal_content)
+        else:
+            parsed = {fallback_key: str(modal_content)}
+        return parsed
+
+    def _stringify_sequence(self, value: Any) -> str:
+        if isinstance(value, list):
+            return ", ".join(str(item) for item in value if str(item).strip())
+        return str(value) if value is not None else ""
+
+    def _build_multimodal_text(
+        self, content_type: str, content_data: Dict[str, Any], context: str
+    ) -> str:
+        parts: list[str] = []
+        if content_type == "image":
+            image_path = content_data.get("img_path", "")
+            captions = self._stringify_sequence(
+                content_data.get("image_caption", content_data.get("img_caption", []))
+            )
+            footnotes = self._stringify_sequence(
+                content_data.get("image_footnote", content_data.get("img_footnote", []))
+            )
+            if image_path:
+                parts.append(f"Image Path: {image_path}")
+            if captions:
+                parts.append(f"Captions: {captions}")
+            if footnotes:
+                parts.append(f"Footnotes: {footnotes}")
+        elif content_type == "table":
+            image_path = content_data.get("img_path", "")
+            caption = self._stringify_sequence(content_data.get("table_caption", []))
+            footnote = self._stringify_sequence(content_data.get("table_footnote", []))
+            body = str(content_data.get("table_body", ""))
+            if image_path:
+                parts.append(f"Table Image Path: {image_path}")
+            if caption:
+                parts.append(f"Table Caption: {caption}")
+            if body:
+                parts.append(f"Table Body: {body}")
+            if footnote:
+                parts.append(f"Table Footnotes: {footnote}")
+        elif content_type == "equation":
+            equation_text = str(content_data.get("text", ""))
+            equation_format = str(content_data.get("text_format", ""))
+            if equation_text:
+                parts.append(f"Equation: {equation_text}")
+            if equation_format:
+                parts.append(f"Format: {equation_format}")
+        else:
+            parts.append(str(content_data.get("content", content_data)))
+
+        if context:
+            parts.append(f"Context: {context}")
+
+        return "\n".join(part for part in parts if part).strip()
+
+    def build_multimodal_payloads(
+        self,
+        modal_content: Any,
+        content_type: str,
+        item_info: Dict[str, Any] | None = None,
+        file_path: str = "manual_creation",
+        description: str | None = None,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], str]:
+        content_data = self._normalize_modal_content(modal_content)
+        context = self._get_context_for_item(item_info) if item_info else ""
+        text_value = self._build_multimodal_text(content_type, content_data, context)
+        if description and description not in text_value:
+            text_value = "\n".join(
+                part for part in [text_value, f"Summary: {description}"] if part
+            )
+
+        embedding_payload: Dict[str, Any] = {
+            "item_type": content_type,
+            "text": text_value,
+        }
+        multimodal_payload: Dict[str, Any] = {
+            "item_type": content_type,
+            "text": text_value,
+            "context_text": context,
+            "file_path": file_path,
+            "content": content_data,
+        }
+
+        image_path = content_data.get("img_path")
+        if image_path:
+            embedding_payload["image"] = image_path
+            multimodal_payload["image"] = image_path
+
+        return embedding_payload, multimodal_payload, context
+
+    def _default_multimodal_description(
+        self,
+        modal_content: Any,
+        content_type: str,
+        item_info: Dict[str, Any] | None = None,
+        entity_name: str | None = None,
+    ) -> Tuple[str, Dict[str, Any]]:
+        content_data = self._normalize_modal_content(modal_content)
+        _, _, context = self.build_multimodal_payloads(
+            content_data,
+            content_type,
+            item_info=item_info,
+            description=None,
+        )
+        summary = self._build_multimodal_text(content_type, content_data, context)
+        if not summary:
+            summary = f"{content_type.title()} content"
+
+        resolved_name = entity_name or f"{content_type}_{compute_mdhash_id(str(content_data))}"
+        return summary, {
+            "entity_name": resolved_name,
+            "entity_type": content_type,
+            "summary": summary[:400],
+        }
 
     def set_content_source(self, content_source: Any, content_format: str = "auto"):
         """Set content source for context extraction
@@ -470,6 +602,9 @@ class BaseModalProcessor:
         batch_mode: bool = False,
         doc_id: str = None,
         chunk_order_index: int = 0,
+        embedding_payload: Dict[str, Any] | None = None,
+        multimodal_payload: Dict[str, Any] | None = None,
+        context_text: str = "",
     ) -> Tuple[str, Dict[str, Any]]:
         """Create entity and text chunk"""
         # Create chunk
@@ -486,6 +621,10 @@ class BaseModalProcessor:
             "full_doc_id": actual_doc_id,  # Use proper document ID
             "file_path": file_path,
         }
+        if multimodal_payload is not None:
+            chunk_data["multimodal_payload"] = multimodal_payload
+        if context_text:
+            chunk_data["context_text"] = context_text
 
         # Store chunk
         await self.text_chunks_db.upsert({chunk_id: chunk_data})
@@ -500,6 +639,8 @@ class BaseModalProcessor:
                 "file_path": file_path,
             }
         }
+        if embedding_payload is not None:
+            chunk_vdb_data[chunk_id]["embedding_content"] = embedding_payload
         await self.chunks_vdb.upsert(chunk_vdb_data)
 
         # Create entity node
@@ -725,13 +866,26 @@ class BaseModalProcessor:
         chunks = {chunk_id: chunk_data}
 
         # Extract entities and relationships
-        chunk_results = await extract_entities(
-            chunks=chunks,
-            global_config=self.global_config,
-            pipeline_status=pipeline_status,
-            pipeline_status_lock=pipeline_status_lock,
-            llm_response_cache=self.hashing_kv,
-        )
+        if (
+            chunk_data.get("multimodal_payload") is not None
+            and self.multimodal_entity_extract_func is not None
+        ):
+            chunk_results = await extract_multimodal_entities(
+                chunks=chunks,
+                global_config=self.lightrag.__dict__,
+                pipeline_status=pipeline_status,
+                pipeline_status_lock=pipeline_status_lock,
+                llm_response_cache=self.hashing_kv,
+                text_chunks_storage=self.text_chunks_db,
+            )
+        else:
+            chunk_results = await extract_entities(
+                chunks=chunks,
+                global_config=self.global_config,
+                pipeline_status=pipeline_status,
+                pipeline_status_lock=pipeline_status_lock,
+                llm_response_cache=self.hashing_kv,
+            )
 
         # Add "belongs_to" relationships for all extracted entities
         processed_chunk_results = []
@@ -842,6 +996,14 @@ class ImageModalProcessor(BaseModalProcessor):
             Tuple of (enhanced_caption, entity_info)
         """
         try:
+            if self.multimodal_entity_extract_func is not None:
+                return self._default_multimodal_description(
+                    modal_content,
+                    content_type,
+                    item_info=item_info,
+                    entity_name=entity_name,
+                )
+
             # Parse image content (reuse existing logic)
             if isinstance(modal_content, str):
                 try:
@@ -968,6 +1130,15 @@ class ImageModalProcessor(BaseModalProcessor):
                 footnotes=", ".join(footnotes) if footnotes else "None",
                 enhanced_caption=enhanced_caption,
             )
+            embedding_payload, multimodal_payload, context_text = (
+                self.build_multimodal_payloads(
+                    content_data,
+                    content_type,
+                    item_info=item_info,
+                    file_path=file_path,
+                    description=enhanced_caption,
+                )
+            )
 
             return await self._create_entity_and_chunk(
                 modal_chunk,
@@ -976,6 +1147,9 @@ class ImageModalProcessor(BaseModalProcessor):
                 batch_mode,
                 doc_id,
                 chunk_order_index,
+                embedding_payload=embedding_payload,
+                multimodal_payload=multimodal_payload,
+                context_text=context_text,
             )
 
         except Exception as e:
@@ -1053,6 +1227,14 @@ class TableModalProcessor(BaseModalProcessor):
             Tuple of (enhanced_caption, entity_info)
         """
         try:
+            if self.multimodal_entity_extract_func is not None:
+                return self._default_multimodal_description(
+                    modal_content,
+                    content_type,
+                    item_info=item_info,
+                    entity_name=entity_name,
+                )
+
             # Parse table content (reuse existing logic)
             if isinstance(modal_content, str):
                 try:
@@ -1162,6 +1344,15 @@ class TableModalProcessor(BaseModalProcessor):
                 table_footnote=", ".join(table_footnote) if table_footnote else "None",
                 enhanced_caption=enhanced_caption,
             )
+            embedding_payload, multimodal_payload, context_text = (
+                self.build_multimodal_payloads(
+                    content_data,
+                    content_type,
+                    item_info=item_info,
+                    file_path=file_path,
+                    description=enhanced_caption,
+                )
+            )
 
             return await self._create_entity_and_chunk(
                 modal_chunk,
@@ -1170,6 +1361,9 @@ class TableModalProcessor(BaseModalProcessor):
                 batch_mode,
                 doc_id,
                 chunk_order_index,
+                embedding_payload=embedding_payload,
+                multimodal_payload=multimodal_payload,
+                context_text=context_text,
             )
 
         except Exception as e:
@@ -1247,6 +1441,14 @@ class EquationModalProcessor(BaseModalProcessor):
             Tuple of (enhanced_caption, entity_info)
         """
         try:
+            if self.multimodal_entity_extract_func is not None:
+                return self._default_multimodal_description(
+                    modal_content,
+                    content_type,
+                    item_info=item_info,
+                    entity_name=entity_name,
+                )
+
             # Parse equation content (reuse existing logic)
             if isinstance(modal_content, str):
                 try:
@@ -1346,6 +1548,15 @@ class EquationModalProcessor(BaseModalProcessor):
                 equation_format=equation_format,
                 enhanced_caption=enhanced_caption,
             )
+            embedding_payload, multimodal_payload, context_text = (
+                self.build_multimodal_payloads(
+                    content_data,
+                    content_type,
+                    item_info=item_info,
+                    file_path=file_path,
+                    description=enhanced_caption,
+                )
+            )
 
             return await self._create_entity_and_chunk(
                 modal_chunk,
@@ -1354,6 +1565,9 @@ class EquationModalProcessor(BaseModalProcessor):
                 batch_mode,
                 doc_id,
                 chunk_order_index,
+                embedding_payload=embedding_payload,
+                multimodal_payload=multimodal_payload,
+                context_text=context_text,
             )
 
         except Exception as e:
@@ -1431,6 +1645,14 @@ class GenericModalProcessor(BaseModalProcessor):
             Tuple of (enhanced_caption, entity_info)
         """
         try:
+            if self.multimodal_entity_extract_func is not None:
+                return self._default_multimodal_description(
+                    modal_content,
+                    content_type,
+                    item_info=item_info,
+                    entity_name=entity_name,
+                )
+
             # Extract context for current item
             context = ""
             if item_info:
@@ -1508,6 +1730,15 @@ class GenericModalProcessor(BaseModalProcessor):
                 content=str(modal_content),
                 enhanced_caption=enhanced_caption,
             )
+            embedding_payload, multimodal_payload, context_text = (
+                self.build_multimodal_payloads(
+                    modal_content,
+                    content_type,
+                    item_info=item_info,
+                    file_path=file_path,
+                    description=enhanced_caption,
+                )
+            )
 
             return await self._create_entity_and_chunk(
                 modal_chunk,
@@ -1516,6 +1747,9 @@ class GenericModalProcessor(BaseModalProcessor):
                 batch_mode,
                 doc_id,
                 chunk_order_index,
+                embedding_payload=embedding_payload,
+                multimodal_payload=multimodal_payload,
+                context_text=context_text,
             )
 
         except Exception as e:

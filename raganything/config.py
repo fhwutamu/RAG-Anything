@@ -51,6 +51,25 @@ class RAGAnythingConfig:
     )
     """Enable equation content processing."""
 
+    multimodal_embedding_model_name: str | None = field(
+        default=get_env_value(
+            "MULTIMODAL_EMBEDDING_MODEL_NAME",
+            None,
+            str,
+            special_none=True,
+        )
+    )
+    """Optional Hugging Face model name/path for native multimodal embeddings."""
+
+    multimodal_embedding_default_instruction: str = field(
+        default=get_env_value(
+            "MULTIMODAL_EMBEDDING_DEFAULT_INSTRUCTION",
+            "Represent the user's input.",
+            str,
+        )
+    )
+    """Default instruction passed to the multimodal embedding model."""
+
     # Batch Processing Configuration
     # ---
     max_concurrent_files: int = field(

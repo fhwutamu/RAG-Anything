@@ -62,6 +62,9 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
     vision_model_func: Optional[Callable] = field(default=None)
     """Vision model function for image analysis."""
 
+    multimodal_entity_extract_func: Optional[Callable] = field(default=None)
+    """Omni multimodal model function for direct entity-relation extraction."""
+
     embedding_func: Optional[Callable] = field(default=None)
     """Embedding function for text vectorization."""
 
@@ -283,6 +286,16 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
                     self.embedding_func = self.lightrag.embedding_func
                     self.logger.debug("Inherited embedding_func from LightRAG instance")
 
+                if self.multimodal_entity_extract_func is None and hasattr(
+                    self.lightrag, "multimodal_entity_extract_func"
+                ):
+                    self.multimodal_entity_extract_func = (
+                        self.lightrag.multimodal_entity_extract_func
+                    )
+                    self.logger.debug(
+                        "Inherited multimodal_entity_extract_func from LightRAG instance"
+                    )
+
                 try:
                     # Ensure LightRAG storages are initialized
                     if (
@@ -334,9 +347,20 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
                 return {"success": False, "error": error_msg}
 
             if self.embedding_func is None:
-                error_msg = "embedding_func must be provided when LightRAG is not pre-initialized"
-                self.logger.error(error_msg)
-                return {"success": False, "error": error_msg}
+                if self.config.multimodal_embedding_model_name:
+                    from raganything.embeddings import create_qwen3_vl_embedding_func
+
+                    self.embedding_func = create_qwen3_vl_embedding_func(
+                        self.config.multimodal_embedding_model_name,
+                        default_instruction=self.config.multimodal_embedding_default_instruction,
+                    )
+                    self.logger.info(
+                        "Initialized Qwen3-VL multimodal embedding function from config"
+                    )
+                else:
+                    error_msg = "embedding_func must be provided when LightRAG is not pre-initialized"
+                    self.logger.error(error_msg)
+                    return {"success": False, "error": error_msg}
 
             from lightrag.kg.shared_storage import initialize_pipeline_status
 
@@ -345,6 +369,7 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
                 "working_dir": self.working_dir,
                 "llm_model_func": self.llm_model_func,
                 "embedding_func": self.embedding_func,
+                "multimodal_entity_extract_func": self.multimodal_entity_extract_func,
             }
 
             # Merge user-provided lightrag_kwargs, which can override defaults

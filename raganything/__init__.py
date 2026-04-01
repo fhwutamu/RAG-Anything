@@ -57,6 +57,17 @@ except ModuleNotFoundError:
 except ImportError:
     pass
 
+try:
+    from .embeddings import (
+        Qwen3VLEmbeddingAdapter as Qwen3VLEmbeddingAdapter,
+        create_qwen3_vl_embedding_func as create_qwen3_vl_embedding_func,
+        normalize_multimodal_embedding_item as normalize_multimodal_embedding_item,
+    )
+except ModuleNotFoundError:
+    pass
+except ImportError:
+    pass
+
 __version__ = "1.2.10"
 __author__ = "Zirui Guo"
 __url__ = "https://github.com/HKUDS/RAG-Anything"
@@ -107,6 +118,15 @@ if "set_prompt_language" in globals():
             "reset_prompts",
             "register_prompt_language",
             "get_available_languages",
+        ]
+    )
+
+if "Qwen3VLEmbeddingAdapter" in globals():
+    __all__.extend(
+        [
+            "Qwen3VLEmbeddingAdapter",
+            "create_qwen3_vl_embedding_func",
+            "normalize_multimodal_embedding_item",
         ]
     )
 

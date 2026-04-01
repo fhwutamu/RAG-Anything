@@ -970,10 +970,20 @@ class ProcessorMixin:
 
             # Use full path or basename based on config
             file_ref = self._get_file_reference(file_path)
+            embedding_payload, multimodal_payload, context_text = data[
+                "processor"
+            ].build_multimodal_payloads(
+                original_item,
+                content_type,
+                item_info=data["item_info"],
+                file_path=file_ref,
+                description=description,
+            )
 
             # Build LightRAG standard chunk format
             chunks[chunk_id] = {
                 "content": formatted_chunk_content,  # Now uses the templated content
+                "embedding_content": embedding_payload,
                 "tokens": tokens,
                 "full_doc_id": doc_id,
                 "chunk_order_index": chunk_order_index,
@@ -984,6 +994,8 @@ class ProcessorMixin:
                 "modal_entity_name": entity_info["entity_name"],
                 "original_type": data["content_type"],
                 "page_idx": data["item_info"].get("page_idx", 0),
+                "multimodal_payload": multimodal_payload,
+                "context_text": context_text,
             }
 
         self.logger.debug(
@@ -1245,21 +1257,36 @@ class ProcessorMixin:
             get_namespace_data,
             get_pipeline_status_lock,
         )
-        from lightrag.operate import extract_entities
+        from lightrag.operate import extract_entities, extract_multimodal_entities
 
         # Get pipeline status (consistent with LightRAG)
         pipeline_status = await get_namespace_data("pipeline_status")
         pipeline_status_lock = get_pipeline_status_lock()
 
-        # Directly use LightRAG's extract_entities
-        chunk_results = await extract_entities(
-            chunks=lightrag_chunks,
-            global_config=self.lightrag.__dict__,
-            pipeline_status=pipeline_status,
-            pipeline_status_lock=pipeline_status_lock,
-            llm_response_cache=self.lightrag.llm_response_cache,
-            text_chunks_storage=self.lightrag.text_chunks,
-        )
+        if (
+            getattr(self.lightrag, "multimodal_entity_extract_func", None) is not None
+            and any(
+                chunk.get("multimodal_payload") is not None
+                for chunk in lightrag_chunks.values()
+            )
+        ):
+            chunk_results = await extract_multimodal_entities(
+                chunks=lightrag_chunks,
+                global_config=self.lightrag.__dict__,
+                pipeline_status=pipeline_status,
+                pipeline_status_lock=pipeline_status_lock,
+                llm_response_cache=self.lightrag.llm_response_cache,
+                text_chunks_storage=self.lightrag.text_chunks,
+            )
+        else:
+            chunk_results = await extract_entities(
+                chunks=lightrag_chunks,
+                global_config=self.lightrag.__dict__,
+                pipeline_status=pipeline_status,
+                pipeline_status_lock=pipeline_status_lock,
+                llm_response_cache=self.lightrag.llm_response_cache,
+                text_chunks_storage=self.lightrag.text_chunks,
+            )
 
         self.logger.info(
             f"Extracted entities from {len(lightrag_chunks)} multimodal chunks"
